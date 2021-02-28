@@ -45,6 +45,9 @@ if ([string]::IsNullOrEmpty($sqldatabase))
     $sqldatabase = "azureoptimization"
 }
 
+$consumptionOffsetDays = [int] (Get-AutomationVariable -Name  "AzureOptimization_ConsumptionOffsetDays")
+$consumptionOffsetDaysStart = $consumptionOffsetDays + 1
+
 $SqlTimeout = 120
 $LogAnalyticsIngestControlTable = "LogAnalyticsIngestControl"
 
@@ -109,7 +112,7 @@ Write-Output "Will run query against tables $disksTableName and $consumptionTabl
 $Conn.Close()    
 $Conn.Dispose()            
 
-$recommendationSearchTimeSpan = 1
+$recommendationSearchTimeSpan = 30 + $consumptionOffsetDaysStart
 
 # Grab a context reference to the Storage Account where the recommendations file will be stored
 
@@ -133,13 +136,17 @@ $baseQuery = @"
     | distinct DiskName_s, InstanceId_s, SubscriptionGuid_g, ResourceGroupName_s, SKU_s, DiskSizeGB_s, Tags_s, Cloud_s 
     | join kind=leftouter (
         $consumptionTableName
-        | where UsageDate_t > stime 
+        | where UsageDate_t between (stime..etime)
     ) on InstanceId_s
     | summarize Last30DaysCost=sum(todouble(Cost_s)) by DiskName_s, InstanceId_s, SubscriptionGuid_g, ResourceGroupName_s, SKU_s, DiskSizeGB_s, Tags_s, Cloud_s    
 "@
 
-$queryResults = Invoke-AzOperationalInsightsQuery -WorkspaceId $workspaceId -Query $baseQuery -Timespan (New-TimeSpan -Days $recommendationSearchTimeSpan)
+$queryResults = Invoke-AzOperationalInsightsQuery -WorkspaceId $workspaceId -Query $baseQuery -Timespan (New-TimeSpan -Days $recommendationSearchTimeSpan) -Wait 600 -IncludeStatistics
 $results = [System.Linq.Enumerable]::ToArray($queryResults.Results)
+
+Write-Output "Query finished with $($results.Count) results."
+
+Write-Output "Query statistics: $($queryResults.Statistics.query)"
 
 # Build the recommendations objects
 
@@ -185,9 +192,12 @@ foreach ($result in $results)
         foreach ($tagPairString in $tagPairs)
         {
             $tagPair = $tagPairString.Split('=')
-            $tagName = $tagPair[0].Trim()
-            $tagValue = $tagPair[1].Trim()
-            $tags[$tagName] = $tagValue
+            if (-not([string]::IsNullOrEmpty($tagPair[0])) -and -not([string]::IsNullOrEmpty($tagPair[1])))
+            {
+                $tagName = $tagPair[0].Trim()
+                $tagValue = $tagPair[1].Trim()
+                $tags[$tagName] = $tagValue    
+            }
         }
     }
 
